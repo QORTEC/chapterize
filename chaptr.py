@@ -1,437 +1,569 @@
 #!/usr/bin/python
-# Chapterize
-# version 0.25
-#
-# To run this application you need ffmpeg and rainbowcrack (with a custom algorithm library)
-# FFmpeg: 2.8.2 -- https://www.ffmpeg.org/
-# RainbowCrack: 1.6.1 -- http://project-rainbowcrack.com
-# RainbowCrack custom algorithm
-#   File: alglib1.cpp -- https://ffmpeg.org/pipermail/ffmpeg-devel/2015-July/175489.html
-#   Build Instructions:  http://project-rainbowcrack.com/alglib.htm
-#
-# Generate Rainbowtable: (using custom algorithm)
-#./rtgen audible byte 4 4 0 10000 10008356 0
-#./rtgen audible byte 4 4 1 10000 10008356 0
-#./rtgen audible byte 4 4 2 10000 10008356 0
-#./rtgen audible byte 4 4 3 10000 10008356 0
-#./rtgen audible byte 4 4 4 10000 10008356 0
-#./rtgen audible byte 4 4 5 10000 10008356 0
-#./rtgen audible byte 4 4 6 10000 10008356 0
-#./rtgen audible byte 4 4 7 10000 10008356 0
-#./rtgen audible byte 4 4 8 10000 10008356 0
-#./rtgen audible byte 4 4 9 10000 10008356 0
-#./rtsort *.rt
-#
-# Move Rainbowtable
-#   1. go to the rainbowcrack directory & create a new folder called activation_bytes
-#   2. place all the .rt files into the activation_bytes folder
-#   3. backup (zip?) activation_bytes folder in case you need a copy in the future...
-#      you really don't want to regenerate the rainbow table, how long did it take?
-#
-# Your ready to run chaptr (Chapterize)
-#
-# NOTE:
-#   For manual setup make sure that applications are properly linked below
-#
+__version__ = '0.3'
+
 # Import needed modules
 import os
 import sys
-import argparse
+#import argparse
 import re
 import glob
-import time
+import json
 import subprocess
-
-# Multi-Threading/Processing
-import Queue
-import threading
+import ffmpy
+import logging
+import time
 import multiprocessing
+#import pprint
 
-from os.path import expanduser
-home = expanduser("~")
 
-# NOTE: user local applications
-rcrack  = home+"/.apps/rainbowcrack/rcrack"
+
+# Script Start
+start_time = time.time()
+
+# get user home directory
+home = os.path.expanduser("~")
+
+# set default location for local apps
 rcrackd = home+"/.apps/rainbowcrack"
-ffmpeg  = home+"/.apps/ffmpeg/ffmpeg"
-ffprobe = home+"/.apps/ffmpeg/ffprobe"
+ffmpegd = home+"/.apps/ffmpeg"
 
-#ext_list   = []
-input_list = [] # currently sys.argv
-file_list  = [] # list of valid targets
-file_dic   = {} # dictionary of information for valid targets
-file_path  = None # string; file path of current job
-hash_byte  = {} # dictionary of checksums and activation_bytes
+# list the supported file extensions
+chapter = ('.mp3',)                 #ouput individual files for each chapter
+volume  = ('.mp4','.m4a','.m4b',)   #ouput a single file with chapter markers
+supported = volume+('.aax',)        #supported input file types
 
-threads = multiprocessing.cpu_count()
-file_information_queue = Queue.Queue()
-file_convert_queue  = Queue.Queue()
-file_activate_queue = Queue.Queue()
-start = time.time()
 
-# crash if applications are missing
-for file_path in (rcrack, ffmpeg, ffprobe):
-    if not os.path.isfile(file_path):
-        print "application missing", file_path
-        exit()
 
-# parse terminal arguments
-parser = argparse.ArgumentParser(description='Chapterize: Audio Book Converter')
-parser.add_argument('-o', '--output',
-    nargs=1,
-    help='path to output directory'
-)
-parser.add_argument('-y',
-    action="store_true",
-    help='overwrite existing files'
-)
-parser.add_argument('-f',
-    action='append',
-    choices=['mp3', 'mp4', 'm4a', 'm4b'],
-    help="output file format"
-)
-parser.add_argument('-activation_bytes',
-    nargs=2,
-    help="define [Checksum] [Byte]"
-)
-parser.add_argument('input',
-    nargs='*',
-    help="directories and or files to convert"
-)
-parser.add_argument('-v',
-    action="store_true",
-    help='about'
-)
-if len(sys.argv)==1:
-    parser.print_help()
-    sys.exit(1)
-args=parser.parse_args()
-
-# about information
-if args.v is True:
-    print u'Chapterize\n\
-    Version:\t0.25\n\
-    Github:\thttps://github.com/QORTEC/chapterize\n\
-\n\
-Special Thanks:\n\
-    K\u0101L\u0113\t for the application name\n\
-    Popey\tfor his great suggestions\n\
-    DareDevlen\tfor helping me debugg code'
-    exit()
-
-input_list = args.input
-overwrite = args.y
-
-# extension list
-ext_list = args.f
-if ext_list is None:
-    ext_list = ['m4b', 'mp3']
-
-if args.activation_bytes is not None:
-    hash_byte[args.activation_bytes[0]] = args.activation_bytes[1]
-
-# run each app input separately
-for file_path in args.input:
-    # if input is supported file add to list
-    if os.path.isfile(file_path):
-        extensions = ('.mp4','.m4a','.m4b','.aax')
-        if file_path.lower().endswith(extensions):
-            file_list.append(file_path)
-    # if input is directory get list of supported files then add to list
-    if os.path.isdir(file_path):
-        extensions = ('*.mp4','*.m4a','*.m4b','*.aax',)
-        for extension in extensions:
-            file_list.extend(glob.glob(file_path+"/"+extension))
-
-# threads!!!
-class file_information(threading.Thread):
-    def __init__(self, queue):
-        threading.Thread.__init__(self)
-        self.queue = queue
-    
-    def run(self):
-        while True:
-            # grabs file_path form queue
-            file_path = self.queue.get()
-            
-            # get ffprobe output
-            ffprobe_output = subprocess.Popen([ffprobe, file_path],  stderr=subprocess.PIPE).stderr.read()
-                
-            try:
-                # get checksum form ffprobe
-                checksum = re.search(r'checksum[A-Za-z0-9= ]+', ffprobe_output).group()
-                checksum = re.sub(r'checksum[= ]+','', checksum)
-                
-                if checksum not in hash_byte:
-                    hash_byte[checksum] = None
-                    print 'New checksum found:', checksum
-            except:
-                checksum = None
-            try:
-                # audio information
-                audio_info = ffprobe_output
-                audio_info = re.sub(r'Duration:[^;]+', '', audio_info)
-                audio_info = re.sub(r'[^;]+Metadata:', '', audio_info)
-                
-                title = re.search(r'title [^\n]*', audio_info).group()
-                title = re.sub(r'title [ ]+: ', '', title)
-                
-                genre = re.search(r'genre [^\n]*', audio_info).group()
-                genre = re.sub(r'genre [ ]+: ', '', genre)
-                
-                artist = re.search(r'artist [^\n]*', audio_info).group()
-                artist = re.sub(r'artist [ ]+: ', '', artist)
-                
-                album_artist = re.search(r'album_artist [^\n]*', audio_info).group()
-                album_artist = re.sub(r'album_artist [ ]+: ', '', album_artist)
-                
-                album = re.search(r'album [^\n]*', audio_info).group()
-                album = re.sub(r'album [ ]+: ', '', album)
-                
-                comment = re.search(r'comment [^\n]*', audio_info).group()
-                comment = re.sub(r'comment [ ]+: ', '', comment)
-                
-                copyright = re.search(r'copyright [^\n]*', audio_info).group()
-                copyright = re.sub(r'copyright [ ]+: ', '', copyright)
-                
-                date = re.search(r'date [^\n]*', audio_info).group()
-                date = re.sub(r'date [ ]+: ', '', date)
-                
-                file_dic[file_path] = {
-                    'title' : { title : None },
-                    'album' : { album : None },
-                    'artist' : { artist : None },
-                    'album_artist' : { album_artist : None },
-                    'copyright' : { copyright : None },
-                    'comment' : { comment : None },
-                    'genre' : { genre : None },
-                    'date' : { date : None },
-                    'performer' : { None : None },
-                    'composer' : { None : None },
-                    'publisher' : { None : None },
-                    'disc' : { None : None },
-                    'track' : { None : None },
-                    'lyrics' : { None : None },
-                    'language' : { None : None },
-                    'encoder' : { None : None },
-                    'encoded_by' : { None : None },
-                    'checksum' : checksum,
-                    'chapter' : []
-                }
-                
-                track_info = ffprobe_output
-                track_info = re.findall(r'Chapter.*?title[^\n]*', track_info, re.S)
-                for match in track_info:
-                    title  = re.sub(r'[^;]+ title [ ]+: ', '', match)
-                    start = re.findall(r'start (.*?),', match)
-                    end   = re.findall(r'end (.*?)\n',  match)
-                    file_dic[file_path]['chapter'].append({'title' : title, 'start' : start, 'end' : end})
-            except:
-                pass
-            
-            #signals to queue job is done
-            self.queue.task_done()
-
-class file_convert(threading.Thread):
-    def __init__(self, queue):
-        threading.Thread.__init__(self)
-        self.queue = queue
-    
-    def run(self):
-        while True:
-            file_path = self.queue.get()
-            
-            def file_info(input_var):
-                try:
-                    if file_dic[file_path][input_var].keys() is not None:
-                        value = file_dic[file_path][input_var].keys()[0]
-                        return value
-                    
-                    if file_dic[file_path][input_var].value() is not None:
-                        value = file_dic[file_path][input_var].values()[0]
-                        return value
-                
-                except:
-                    pass
-                
-                return ''
-            
-            def meta_info(input_var):
-                try:
-                    value = file_info(input_var)
-                    return '-metadata '+input_var+'="'+value+'" '
-                except:
-                    pass
-                
-                return ''
-            
-            def convert(file_path, extension, title='', start='', end=''):
-                checksum = file_dic[file_path]['checksum']
-                directory_path = os.path.dirname(file_path)+'/' ## directory of file
-                file_name = file_info('title')
-                file_output = '"'+directory_path+file_name+'.'+extension+'"'
-                file_path   = '"'+file_path+'"'
-                
-                if start:
-                    start = ' -ss '+start+' '
-                if end:
-                    end   = ' -to '+end+' '
-                
-                if checksum:
-                    activate = ' -activation_bytes '+hash_byte[checksum]+' '
-                if not checksum:
-                    activate = ''
-                
-                if not title:
-                    meta_title = meta_info('title')
-                if title:
-                    meta_title = ' -metadata title="'+file_name+' - '+title+'" '
-                
-                if overwrite is True:
-                     write = ' -y '
-                if overwrite is False:
-                     write = ' -n '
-                
-                variable = start+end+write+' -vn '
-                metadata = (
-                    meta_title
-                    +meta_info('album')
-                    +meta_info('artist')
-                    +meta_info('album_artist')
-                    +meta_info('copyright')
-                    +meta_info('comment')
-                    +meta_info('genre')
-                    +meta_info('date')
-                    +meta_info('performer')
-                    +meta_info('composer')
-                    +meta_info('publisher')
-                    +meta_info('disc')
-                    +meta_info('track')
-                    +meta_info('lyrics')
-                    +meta_info('language')
-                    +meta_info('encoder')
-                    +meta_info('encoded_by')
-                )
-                
-                #ffmpeg+' -loglevel panic '+activate+' -i '+file_path+variable+metadata+file_output
-                
-                #subprocess.Popen(['echo '+ffmpeg+' -loglevel panic '+activate+' -i '+file_path+variable+metadata+file_output], shell=True).wait()
-                #print 'echo '+ffmpeg+' -loglevel panic '+activate+' -i '+file_path+variable+metadata+file_output
-                
-                #print ffmpeg
-                #print activate
-                #print file_path
-                #print variable
-                #print metadata
-                #print file_output
-                
-                # Title:
-                # {Name} {Track No} - {Title}
-                # {directory path}/{Name}/{Output File Name}
-                # directory should be same as source file...
-                
-                if extension in ('mp4','m4a','m4b'):
-                    #print 'debut running '+extension
-                    variable = variable+' -c:a copy -f mp4 '
-                    subprocess.Popen([ffmpeg+' -loglevel panic '+activate+' -i '+file_path+variable+metadata+file_output], shell=True).wait()
-                
-                if extension is 'mp3':
-                    #print 'debut running '+extension
-                    variable = variable+' -write_xing 0 '
-                    directory_path  = directory_path+file_name+'/'
-                    file_output = '"'+directory_path+file_name+' - '+title+'.'+extension+'"'
-                    subprocess.Popen([ffmpeg+' -loglevel panic '+activate+' -i '+file_path+variable+metadata+file_output], shell=True).wait()
-            
-            for extension in ext_list:
-                if (extension in ('mp4','m4a','m4b') and
-                    not file_path.lower().endswith(('.mp4','.m4a','m4b'))):
-                    convert(file_path, extension)
-                    #pass
-                
-                if (extension in ('mp3') and
-                    not file_path.lower().endswith('.mp3')):
-                    for chaptr in file_dic[file_path]['chapter']:
-                        start = chaptr['start'][0]
-                        end   = chaptr['end'][0]
-                        title = chaptr['title']
-                        
-                        directory = os.path.dirname(file_path)+"/"
-                        directory = directory+file_info('title')
-                        
-                        if not os.path.exists(directory):
-                            os.makedirs(directory)
-                        
-                        convert(file_path, extension, title, start, end)
-            
-            #signals to queue job is done
-            self.queue.task_done()
-
-class file_activate(threading.Thread):
-    def __init__(self, queue):
-        threading.Thread.__init__(self)
-        self.queue = queue
-    
-    def run(self):
-        while True:
-            file_path = self.queue.get()
-            checksum  = file_dic[file_path]['checksum']
-            
-            # get activation_bytes to extract audio
-            for checksum, byte in hash_byte.iteritems():
-                # if activation_bytes are unknown look them up
-                if byte == None:
-                    rcrack_output = subprocess.Popen([rcrack+' '+rcrackd+'/activation_bytes/*.rt -h '+checksum], shell=True, cwd=rcrackd, stdout=subprocess.PIPE).stdout.read()
-                    
-                    byte = re.search(r'hex:[A-Za-z0-9]+', rcrack_output).group()
-                    byte = re.sub(r'hex:','', byte)
-                    
-                    hash_byte[checksum] = byte
-                    print hash_byte
-            
-            #signals to queue job is done
-            self.queue.task_done()
-
-def main():
-    #spawn a pool of threads, and pass them queue instance
-    for i in range(threads-1):
-        t = file_information(file_information_queue)
-        t.setDaemon(True)
-        t.start()
-    
-    #populate queue with data
-    for file_path in file_list:
-        file_information_queue.put(file_path)
-    
-    #wait on the queue until everything has been processed
-    file_information_queue.join()
-    
-    for i in range(1):
-        t = file_activate(file_activate_queue)
-        t.setDaemon(True)
-        t.start()
-    
-    for file_path in file_list:
-        file_activate_queue.put(file_path)
-        #pass
-    
-    #GUI...
-    
-    file_activate_queue.join()
-    
-    for i in range(threads-1):
-        t = file_convert(file_convert_queue)
-        t.setDaemon(True)
-        t.start()
-    
-    for file_path in file_list:
-        file_convert_queue.put(file_path)
-        #pass
+class info(object):
+    """retreave information needed for file conversion"""
+    def __init__(self, file=None):
+        self.file = file
+        self.file_dic  = {}
         
-    #wait on the queue until everything has been processed
-    file_convert_queue.join()
     
-main()
-print "Elapsed Time: %s" % (time.time() - start)
+    def ffprobe(self):
+        """use FFprobe we retreave metadata used to create/convert the new audio files"""
+        ffprobe_output = ffmpy.FFprobe(
+            global_options='-hide_banner',
+            inputs={self.file : '-print_format json -show_format -show_chapters -show_streams'}
+        ).run(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        
+        ffprobe_output = list(ffprobe_output)
+        ffprobe_output[0] = ffprobe_output[0].decode('utf-8')
+        ffprobe_output[1] = ffprobe_output[1].decode('utf-8')
+        ffprobe_output[0] = json.loads(ffprobe_output[0])
+        
+        try:
+            checksum = re.search(r'checksum[A-Za-z0-9= ]+', ffprobe_output[1]).group()
+            checksum = re.sub(r'checksum[= ]+','', checksum)
+        except:
+            checksum = None
+        
+        file_path     = ffprobe_output[0]['format']['filename']
+        title         = ffprobe_output[0]['format']['tags']['title']
+        album         = ffprobe_output[0]['format']['tags']['album']
+        artist        = ffprobe_output[0]['format']['tags']['artist']
+        album_artist  = ffprobe_output[0]['format']['tags']['album_artist']
+        copyright     = ffprobe_output[0]['format']['tags']['copyright']
+        comment       = ffprobe_output[0]['format']['tags']['comment']
+        genre         = ffprobe_output[0]['format']['tags']['genre']
+        date          = ffprobe_output[0]['format']['tags']['date']
+        checksum      = checksum
+        
+        self.file_dic[self.file] = {
+            'title' : { title : None },
+            'album' : { album : None },
+            'artist' : { artist : None },
+            'album_artist' : { album_artist : None },
+            'copyright' : { copyright : None },
+            'comment' : { comment : None },
+            'genre' : { genre : None },
+            'date' : { date : None },
+            'performer' : { None : None },
+            'composer' : { None : None },
+            'publisher' : { None : None },
+            'disc' : { None : None },
+            'track' : { None : None },
+            'lyrics' : { None : None },
+            'language' : { None : None },
+            'encoder' : { None : None },
+            'encoded_by' : { None : None },
+            'checksum' : checksum,
+            'chapter' : []
+        }
+        
+        # mp3 chpater seperation code...
+        track = [ 0 , len(ffprobe_output[0]['chapters']) ]
+        for chapter in ffprobe_output[0]['chapters']:
+            title = chapter['tags']['title']
+            start = chapter['start_time']
+            end   = chapter['end_time']
+            track[0] += 1
+            
+            self.file_dic[self.file]['chapter'].append({
+                'title' : { title : None },
+                'start' : start,
+                'end' : end,
+                'track' : { str(track[0])+'/'+str(track[1]) : None }
+            })
+        
+        return self.file_dic
+    
+    
+    def rcrack(self, checksum=None):
+        """using rcrack we retreave "actavation bytes" needed to decrypt certain audio files"""
+        cmd  = ['./rcrack']
+        cmd += ['./activation_bytes/*.rt']
+        cmd += [['-h '+checksum]]
+        cmdS = subprocess.list2cmdline(cmd)
+        
+        #print(cmdS)
+        byte = subprocess.Popen(cmdS, shell=True, cwd=rcrackd, stdout=subprocess.PIPE).stdout.read()
+        byte = byte.decode('utf-8', 'ignore')
+        
+        byte = re.search(r'hex:[A-Za-z0-9]+', byte).group()
+        byte = re.sub(r'hex:','', byte)
+        
+        return byte
 
-#for file_path in file_list:
-#    print file_path
+
+class convert(object):
+    """create/convert the audio files..."""
+    def __init__(self, file_dic=None, hash_byte=None):
+        self.file_dic = file_dic
+        self.file = list(file_dic)[0]
+        
+        self.extension = []
+    
+    
+    def argument(self, dictionary, element, value=False):
+        """check for a overide valude for the dictionary entry, and return the FFmpeg metadata command or the falue its self"""
+        try:
+            if list(dictionary[element].keys())[0] is not None:
+                output = list(dictionary[element].keys())[0]
+            
+            if list(dictionary[element].values())[0] is not None:
+                output = list(dictionary[element].values())[0]
+            
+            if value is True:
+                return output
+            else:
+                return '-metadata %s="%s"' % (element, output)
+        
+        except:
+            pass
+        
+        return ''
+    
+    
+    def command(self, extension=None, overwrite=False):
+        """using metadata create a list of commands to create/convert the new audio files..."""
+        chapter = ('.mp3')
+        volume  = ('.mp4','.m4a','.m4b')
+        
+        
+        extension = '.mp3'
+        overwrite = False
+        
+        
+        if overwrite is True:
+             cmd_write = ['-y']
+        else:
+             cmd_write = ['-n']
+        
+        cmd_global_common = ['-loglevel panic'] + cmd_write
+        
+        checksum = self.file_dic[self.file]['checksum']
+        if checksum:
+            cmd_activate = ['-activation_bytes %s' % hash_byte[checksum]]
+        if not checksum:
+            cmd_activate = ['']
+        #cmd_activate = ['']
+        
+        
+        cmd_metadata_common  = [self.argument(self.file_dic[self.file], 'album')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'artist')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'album_artist')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'copyright')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'comment')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'genre')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'date')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'performer')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'composer')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'publisher')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'disc')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'lyrics')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'language')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'encoder')]
+        cmd_metadata_common += [self.argument(self.file_dic[self.file], 'encoded_by')]
+        
+        
+        cmd_return = []
+        
+        if extension in volume:
+            #['-metadata major_brand="M4B"', '-metadata compatible_brands="M4A mp42isom"']
+            cmd_metadata  = [] + cmd_metadata_common
+            cmd_metadata += [self.argument(self.file_dic[self.file], 'title')]
+            cmd_metadata += [self.argument(self.file_dic[self.file], 'track')]
+            
+            cmd_global = [] + cmd_global_common
+            cmd_input  = [] + cmd_activate
+            cmd_output = [] + ['-vn', '-c:a copy'] + cmd_metadata + ['-f mp4']
+            
+            cmd_global = list(filter(None, cmd_global))
+            cmd_input  = list(filter(None, cmd_input))
+            cmd_output = list(filter(None, cmd_output))
+            
+            cmd_global = ' '.join(cmd_global)
+            cmd_input  = ' '.join(cmd_input)
+            cmd_output = ' '.join(cmd_output)
+            
+            file_name  = '%s.m4b' % self.argument(self.file_dic[self.file], 'album', value=True)
+            
+            
+            cmd_return += [[[cmd_global], [self.file], [cmd_input], [file_name], [cmd_output]]]
+        
+        if extension in chapter:
+            
+            cmd_global = [] + cmd_global_common
+            cmd_input  = [] + cmd_activate
+            cmd_output = [] + ['-an', '-vcodec copy']
+            
+            file_name = '%s.jpg' % self.argument(self.file_dic[self.file], 'album', value=True)
+            
+            cmd_global = list(filter(None, cmd_global))
+            cmd_input  = list(filter(None, cmd_input))
+            cmd_output = list(filter(None, cmd_output))
+            
+            cmd_global = ' '.join(cmd_global)
+            cmd_input  = ' '.join(cmd_input)
+            cmd_output = ' '.join(cmd_output)
+            
+            
+            cmd_return += [[[cmd_global], [self.file], [cmd_input], [file_name], [cmd_output]]]
+            
+            
+            for chapter in self.file_dic[self.file]['chapter']:
+                cmd_metadata  = ['-map_metadata -1', '-map_chapters -1'] + cmd_metadata_common
+                cmd_metadata += [self.argument(chapter, 'title')]
+                cmd_metadata += [self.argument(chapter, 'track')]
+                
+                cmd_time   = ['-ss %s' % chapter['start']]
+                cmd_time  += ['-to %s' % chapter['end']]
+                
+                cmd_global = [] + cmd_global_common
+                cmd_input  = [] + cmd_activate
+                cmd_output = [] + cmd_time + ['-vn', '-write_xing 0'] + cmd_metadata
+                
+                cmd_global = list(filter(None, cmd_global))
+                cmd_input  = list(filter(None, cmd_input))
+                cmd_output = list(filter(None, cmd_output))
+                
+                cmd_global = ' '.join(cmd_global)
+                cmd_input  = ' '.join(cmd_input)
+                cmd_output = ' '.join(cmd_output)
+                
+                file_name = '%s - %s.mp3' % (self.argument(self.file_dic[self.file], 'album', value=True), self.argument(chapter, 'title', value=True))
+                
+                
+                cmd_return += [[[cmd_global], [self.file], [cmd_input], [file_name], [cmd_output]]]
+        
+        return cmd_return
+    
+    
+    def run(self, cmd):
+        """convert the audio files..."""
+        ffmpy.FFmpeg(
+            global_options=cmd[0],
+            inputs= { cmd[1] : cmd[2] },
+            outputs={ cmd[3] : cmd[4] },
+        ).run()
+
+
+class input(object):
+    def __init__(self, input):
+        self.file_list = []
+        # run each app input separately
+        for file_path in input:
+            self.file_list += self.validate(file_path)
+    
+    
+    def validate(self, file_path):
+        output = []
+        
+        if os.path.isfile(file_path):
+            if file_path.lower().endswith(supported):
+                output = [file_path]
+        
+        if os.path.isdir(file_path):
+            for extension in supported:
+                output = glob.glob(file_path+"/*"+extension)
+        
+        return output
+    
+    
+    def list(self):
+        return self.file_list
+
+
+class process(object):
+    def __init__(self, process_id, seppuku=False, queue=None):
+        self.process_id = process_id
+        self.seppuku = seppuku
+        self.queue = queue
+    
+    def is_alive(self):
+        is_alive = []
+        
+        for child_process in self.process_id:
+            if child_process.is_alive():
+                is_alive += [child_process]
+            
+        return is_alive
+    
+    def start(self):
+        for child_process in self.process_id:
+            child_process.start()
+            logging.debug('started child process %s' % child_process)
+            
+            if self.seppuku:
+                self.queue.put('seppuku')
+    
+    def join(self, join_timeout=None):
+        for child_process in self.process_id:
+            child_process.join(join_timeout)
+
+
+
+# function for Main Script
+def queue_list(comment=None):
+    # list the number if items in the queue
+    print (' ')
+    if comment is not None:
+        print(comment)
+    
+    print('ckecksum %s' % q_checksum.qsize())
+    print('input    %s' % q_file_list.qsize())
+    print('list     %s' % q_file_dic.qsize())
+    print('cmd      %s' % q_file_cmd.qsize())
+    
+    try:
+        print('output   %s' % output_queue.qsize())
+    except:
+        print('output   %s' % q_output.qsize())
+
+
+def q2q(target=None):
+    # this function retreaves items form the output queue and moves them into the proper queue for later use
+    
+    # Move q_output to q_file_dic
+    if target is 'q_file_dic':
+        sums = []
+        
+        while not q_output.empty():
+            output = q_output.get()
+            
+            logging.debug('queue size: %s' % q_output.qsize())
+            logging.debug(output)
+            
+            q_file_dic.put(output)
+            
+            file_name = list(output)[0]
+            checksum = output[file_name]['checksum']
+            
+            if checksum and checksum not in sums:
+                logging.info('Found newe checksum: %s' % checksum)
+                q_checksum.put(checksum)
+                
+                sums += [checksum]
+    
+    # Move q_output to q_file_cmd
+    if target is 'q_file_cmd':
+        while not q_output.empty():
+            output = q_output.get()
+            
+            logging.debug('queue size: %s' % q_output.qsize())
+            logging.debug(output)
+            
+            for item in output:
+                logging.debug(item)
+                logging.debug('cmd_global: %s' % item[0])
+                logging.debug('input_file: %s' % item[1])
+                logging.debug('cmd_input:  %s' % item[2])
+                logging.debug('file_name:  %s' % item[3])
+                logging.debug('cmd_output: %s' % item[4])
+                
+                q_file_cmd.put(item)
+
+
+
+# child_process
+def proc0(working_queue, dic = {}):
+    while True:
+        item = working_queue.get()
+        
+        if item == 'seppuku':
+            break
+        
+        # check if checksum is in local dictionary
+        if item and item not in dic:
+            logging.info('Found newe checksum: %s' % item)
+            dic[item] = None
+        
+        # lookup infomation in dictionary
+        for item, output in dic.items(): #iteritems
+            if output == None:
+                dic[item] = info().rcrack(item)
+            
+            #print(dic[item])
+
+
+def proc1(working_queue, output_queue):
+    while True:
+        item = working_queue.get()
+        
+        if item == 'seppuku':
+            break
+        
+        output = info(item).ffprobe()
+        output_queue.put(output)
+    
+    #queue_list()
+    #output_queue.cancel_join_thread()
+
+
+def proc2(working_queue, output_queue, dic):
+    while q_file_dic.qsize() > 0:
+        try:
+            item = working_queue.get(True, 0.8)
+        
+        except:
+            break
+        
+        output = convert(item, dic).command()
+        output_queue.put(output)
+    
+    #queue_list()
+    #output_queue.cancel_join_thread()
+
+
+def proc3(working_queue):
+    while q_file_cmd.qsize() > 0:
+        try:
+            item = working_queue.get(True, 0.8)
+        
+        except:
+            break
+        
+        #print(item)
+
+
+
+# Main Script
+if __name__ == '__main__':
+    logging.info('chaptr.py started')
+    cpu_core = multiprocessing.cpu_count()
+    #cpu_core = 2
+    
+    queue_info_input  = multiprocessing.Queue()
+    queue_info_output = multiprocessing.Queue()
+    
+    q_size      = 0
+    q_output    = multiprocessing.Queue()
+    q_file_list = multiprocessing.Queue()
+    q_file_dic  = multiprocessing.Queue()
+    q_file_cmd  = multiprocessing.Queue()
+    q_checksum  = multiprocessing.Queue()
+    hash_byte   = multiprocessing.Manager().dict()
+    
+    join_timeout = 0.2
+    
+    logging.info('building a list of valid files')
+    for blah in input(['test.aax', 'test2.aax', 'test/', '/home/qortec/Desktop/Audible/AAX']).list():
+        q_file_list.put(blah)
+        q_size += 1
+    
+    
+    
+    process_0 = [multiprocessing.Process(target=proc0, args=(q_checksum,  hash_byte)) for i in range(1)]
+    process_1 = [multiprocessing.Process(target=proc1, args=(q_file_list, q_output,)) for i in range(cpu_core - 1)]
+    process_2 = [multiprocessing.Process(target=proc2, args=(q_file_dic,  q_output, hash_byte,)) for i in range(cpu_core - 1)]
+    process_3 = [multiprocessing.Process(target=proc3, args=(q_file_cmd,)) for i in range(cpu_core - 1)]
+    
+    
+    # Step 0.5
+    # -- start a single child_process
+    # -- use any avaiable method to get the activation bytes
+    process(process_0).start()
+    
+    
+    # Step 1:
+    # -- start cpu_core - 1 child_process
+    # -- use FFprobe to get revelant information form supported files
+    process(process_1, True, q_file_list).start()
+    
+    # -- while child_process are active run
+    while process(process_1).is_alive():
+        # -- take information form output queue amd move it to the correct queue for later use
+        q2q('q_file_dic')
+        
+        # -- if the output queue is empty try "joining" the process
+        if q_output.empty():
+            process(process_0).join(join_timeout)
+    
+    # -- rerun command to clean up any items left in the queue
+    q2q('q_file_dic')
+    
+    
+    # Step 1.5
+    # -- send seppuku signle
+    # -- try "joining" process
+    q_checksum.put('seppuku')
+    
+    # -- while child_process is active run
+    while process(process_0).is_alive():
+        process(process_0).join(join_timeout)
+    
+    
+    # Step 2:
+    # -- start cpu_core - 1 child_process
+    # -- use the information provided by FFprobe to create FFmpeg conversion commands
+    process(process_2).start()
+    
+    # -- while child_process are active run
+    while process(process_2).is_alive():
+        q2q('q_file_cmd')
+        
+        # -- if the output queue is empty try "joining" the process
+        if q_output.empty():
+            process(process_2).join(join_timeout)
+    
+    # -- rerun command to clean up any items left in the queue
+    q2q('q_file_cmd')
+    
+    
+    # Step 3:
+    # -- start cpu_core - 1 child_process
+    # -- run FFmpeg commands to convert audio files...
+    process(process_3).start()
+    
+    # -- while child_process are active run
+    while process(process_3).is_alive():
+        
+        
+        # -- if command queue is empty try "joining" the process
+        if q_file_cmd.empty():
+            process(process_3).join(join_timeout)
+    
+    
+    # Step 4:
+    # -- print the run time of app
+    # -- we are done!
+    print("--- %s seconds ---" % (time.time() - start_time))
+    
+    
+    #if multiprocessing.active_children():
+    #    print(multiprocessing.active_children())
+    
+    sys.exit()
